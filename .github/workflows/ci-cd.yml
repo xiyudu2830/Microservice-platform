@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    # Keep the integration tests on a 6.8 kernel until the MongoDB 8.0 image
+    # includes the Ubuntu kernel compatibility fix (SERVER-131779).
+    runs-on: ubuntu-22.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
@@ -67,6 +69,7 @@ jobs:
       - name: Print diagnostics on failure
         if: failure()
         run: |
+          uname -r
           docker compose ps || true
           docker compose logs --tail=30 || true
           kubectl --context kind-governance -n governance get pods,pvc -o wide || true
