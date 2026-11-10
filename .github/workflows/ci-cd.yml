@@ -1,0 +1,144 @@
+name: CI and staging delivery
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.10"
+          cache-dependency-path: go.sum
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.5
+      - name: Test and lint
+        run: |
+          make test
+          helm lint deploy/helm/governance --set demo.enabled=true
+          helm lint deploy/helm/governance \
+            --set rpcTLS.secretName=governance-tls,rpcTLS.serverName=internal.example.test,smtp.address=smtp.example.test:587
+      - name: Compose smoke test
+        run: |
+          make demo-up
+          make demo
+          make demo-down
+      - name: Create kind cluster and load both image tags
+        run: |
+          go install sigs.k8s.io/kind@v0.31.0
+          kind create cluster --name governance --wait 180s
+          docker tag governance:local governance:ci-rollout
+          kind load docker-image governance:local governance:ci-rollout --name governance
+      - name: Deploy, exercise endpoints, and sample rolling update
+        env:
+          KUBE_CONTEXT: kind-governance
+        run: |
+          scripts/k8s-demo.sh
+          kubectl --context "$KUBE_CONTEXT" -n governance port-forward svc/governance-broker 18080:8080 &
+          broker_pid=$!
+          kubectl --context "$KUBE_CONTEXT" -n governance port-forward svc/governance-mailpit 18025:8025 &
+          mail_pid=$!
+          trap 'kill "$broker_pid" "$mail_pid" 2>/dev/null || true' EXIT
+          for i in {1..30}; do
+            if curl -sSf http://127.0.0.1:18025/api/v1/messages >/dev/null &&
+              [[ $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/routes) == 401 ]]; then
+              break
+            fi
+            sleep 1
+          done
+          BASE_URL=http://127.0.0.1:18080 MAILPIT_URL=http://127.0.0.1:18025 make demo
+          IMAGE_TAG=ci-rollout scripts/rollout-probe.sh
+      - name: Upload rollout measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollout-results
+          path: rollout-results.csv
+          if-no-files-found: ignore
+      - name: Print diagnostics on failure
+        if: failure()
+        run: |
+          docker compose ps || true
+          docker compose logs --tail=30 || true
+          kubectl --context kind-governance -n governance get pods,pvc -o wide || true
+          kubectl --context kind-governance -n governance get events --sort-by=.metadata.creationTimestamp || true
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      repository: ${{ steps.image.outputs.repository }}
+      digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build and publish the tested commit
+        id: image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx build --push --tag "$image:$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --metadata-file "$RUNNER_TEMP/image.json" .
+          echo "repository=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$(jq -er '."containerimage.digest"' "$RUNNER_TEMP/image.json")" >> "$GITHUB_OUTPUT"
+
+  staging:
+    if: vars.ENABLE_STAGING_CD == 'true'
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    concurrency:
+      group: governance-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.5
+      - name: Deploy immutable image digest
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+          IMAGE_REPOSITORY: ${{ needs.publish.outputs.repository }}
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+          KUBE_NAMESPACE: ${{ vars.STAGING_NAMESPACE || 'governance' }}
+          RPC_TLS_SECRET: ${{ vars.RPC_TLS_SECRET }}
+          RPC_TLS_SERVER_NAME: ${{ vars.RPC_TLS_SERVER_NAME }}
+          SMTP_ADDRESS: ${{ vars.SMTP_ADDRESS }}
+          SMTP_FROM: ${{ vars.SMTP_FROM }}
+          IMAGE_PULL_SECRET: ${{ vars.IMAGE_PULL_SECRET }}
+        run: |
+          : "${KUBECONFIG_B64:?Configure the staging environment secret}"
+          : "${RPC_TLS_SECRET:?Configure the internal TLS Secret name}"
+          : "${RPC_TLS_SERVER_NAME:?Configure the internal certificate DNS name}"
+          : "${SMTP_ADDRESS:?Configure the SMTP endpoint}"
+          : "${SMTP_FROM:?Configure the SMTP sender}"
+          umask 077
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          trap 'rm -f "$KUBECONFIG"' EXIT
+          printf '%s' "$KUBECONFIG_B64" | base64 --decode > "$KUBECONFIG"
+          pull_secret=()
+          if [[ -n "$IMAGE_PULL_SECRET" ]]; then
+            pull_secret=(--set-string "imagePullSecrets[0].name=$IMAGE_PULL_SECRET")
+          fi
+          helm upgrade --install governance deploy/helm/governance --namespace "$KUBE_NAMESPACE" \
+            --set-string image.repository="$IMAGE_REPOSITORY" --set-string image.digest="$IMAGE_DIGEST" \
+            --set-string rpcTLS.secretName="$RPC_TLS_SECRET" --set-string rpcTLS.serverName="$RPC_TLS_SERVER_NAME" \
+            --set-string smtp.address="$SMTP_ADDRESS" --set-string smtp.from="$SMTP_FROM" \
+            "${pull_secret[@]}" --atomic --wait --timeout 5m --history-max 10
