@@ -1,0 +1,123 @@
+{{- if .Values.demo.enabled }}
+{{- $prefix := include "governance.prefix" . -}}
+{{- range $db := list "postgres" "mongo" }}
+{{- $postgres := eq $db "postgres" }}
+{{- $port := ternary 5432 27017 $postgres }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $prefix }}-{{ $db }}
+  labels:
+    {{- include "governance.labels" $ | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "governance.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $db }}
+  ports:
+    - {port: {{ $port }}, targetPort: db}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $prefix }}-{{ $db }}
+  labels:
+    {{- include "governance.labels" $ | nindent 4 }}
+spec:
+  serviceName: {{ $prefix }}-{{ $db }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "governance.labels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $db }}
+  template:
+    metadata:
+      labels:
+        {{- include "governance.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $db }}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: db
+          image: {{ ternary $.Values.demo.postgresImage $.Values.demo.mongoImage $postgres | quote }}
+          ports:
+            - {name: db, containerPort: {{ $port }}}
+          env:
+            {{- if $postgres }}
+            - {name: POSTGRES_USER, value: governance}
+            - {name: POSTGRES_DB, value: governance}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ $.Values.existingSecret | quote }}, key: POSTGRES_PASSWORD}
+            {{- else }}
+            - {name: MONGO_INITDB_ROOT_USERNAME, value: governance}
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ $.Values.existingSecret | quote }}, key: MONGO_PASSWORD}
+            {{- end }}
+          readinessProbe:
+            exec:
+              {{- if $postgres }}
+              command: [pg_isready, -h, 127.0.0.1, -U, governance, -d, governance]
+              {{- else }}
+              command: [sh, -ec, 'mongosh --quiet --username "$MONGO_INITDB_ROOT_USERNAME" --password "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok"']
+              {{- end }}
+            periodSeconds: 5
+            timeoutSeconds: 4
+          volumeMounts:
+            - {name: data, mountPath: {{ ternary "/var/lib/postgresql/data" "/data/db" $postgres }}}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ $.Values.demo.storage | quote }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $prefix }}-mailpit
+  labels:
+    {{- include "governance.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "governance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mailpit
+  ports:
+    - {name: smtp, port: 1025, targetPort: smtp}
+    - {name: ui, port: 8025, targetPort: ui}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $prefix }}-mailpit
+  labels:
+    {{- include "governance.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "governance.labels" . | nindent 6 }}
+      app.kubernetes.io/component: mailpit
+  template:
+    metadata:
+      labels:
+        {{- include "governance.labels" . | nindent 8 }}
+        app.kubernetes.io/component: mailpit
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mailpit
+          image: {{ .Values.demo.mailpitImage | quote }}
+          ports:
+            - {name: smtp, containerPort: 1025}
+            - {name: ui, containerPort: 8025}
+          readinessProbe:
+            tcpSocket: {port: smtp}
+            periodSeconds: 2
+{{- end }}

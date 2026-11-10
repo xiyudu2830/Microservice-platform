@@ -1,0 +1,168 @@
+{{- $prefix := include "governance.prefix" . -}}
+{{- if not .Values.demo.enabled -}}
+{{- $_ := required "rpcTLS.secretName is required when demo.enabled is false" .Values.rpcTLS.secretName -}}
+{{- $_ := required "smtp.address is required when demo.enabled is false" .Values.smtp.address -}}
+{{- if not .Values.smtp.requireTLS -}}
+{{- fail "smtp.requireTLS must be true when demo.enabled is false" -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.rpcTLS.secretName -}}
+{{- $_ := required "rpcTLS.serverName is required when rpcTLS.secretName is set" .Values.rpcTLS.serverName -}}
+{{- end -}}
+{{- $workloads := printf "standard=%s-echo-standard:9090,priority=%s-echo-priority:9090" $prefix $prefix -}}
+{{- range $component := list "broker" "auth" "registry" "audit" "notify" "echo-standard" "echo-priority" }}
+{{- $broker := eq $component "broker" }}
+{{- $port := ternary 8080 9090 $broker }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $prefix }}-{{ $component }}
+  labels:
+    {{- include "governance.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  {{- if not $broker }}
+  clusterIP: None
+  {{- end }}
+  ports:
+    - name: {{ ternary "http" "grpc" $broker }}
+      port: {{ $port }}
+      targetPort: app
+  selector:
+    {{- include "governance.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $prefix }}-{{ $component }}
+  labels:
+    {{- include "governance.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  replicas: {{ $.Values.replicaCount }}
+  minReadySeconds: 3
+  progressDeadlineSeconds: 240
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "governance.labels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $component }}
+  template:
+    metadata:
+      labels:
+        {{- include "governance.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 25
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: app
+          image: {{ include "governance.image" $ | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args: [{{ ternary "echo" $component (hasPrefix "echo-" $component) | quote }}]
+          ports:
+            - {name: app, containerPort: {{ $port }}}
+            - {name: health, containerPort: 8081}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sleep", "5"]
+          startupProbe:
+            httpGet: {path: /livez, port: health}
+            periodSeconds: 2
+            failureThreshold: 15
+          readinessProbe:
+            httpGet: {path: /readyz, port: health}
+            periodSeconds: 2
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet: {path: /livez, port: health}
+            periodSeconds: 10
+          env:
+            - name: INTERNAL_RPC_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ $.Values.existingSecret | quote }}, key: INTERNAL_RPC_KEY}
+            {{- if $.Values.rpcTLS.secretName }}
+            - {name: RPC_TLS_DIR, value: /var/run/governance-tls}
+            - {name: RPC_TLS_SERVER_NAME, value: {{ $.Values.rpcTLS.serverName | quote }}}
+            {{- end }}
+            {{- if or $broker (eq $component "registry") }}
+            - {name: WORKLOADS, value: {{ $workloads | quote }}}
+            {{- end }}
+            {{- if $broker }}
+            - {name: AUTH_ADDR, value: {{ printf "%s-auth:9090" $prefix | quote }}}
+            - {name: REGISTRY_ADDR, value: {{ printf "%s-registry:9090" $prefix | quote }}}
+            - {name: AUDIT_ADDR, value: {{ printf "%s-audit:9090" $prefix | quote }}}
+            - {name: NOTIFY_ADDR, value: {{ printf "%s-notify:9090" $prefix | quote }}}
+            {{- else if eq $component "auth" }}
+            {{- $secret := default $.Values.existingSecret $.Values.authSecret }}
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef: {name: {{ $secret | quote }}, key: POSTGRES_DSN}
+            - name: BOOTSTRAP_EMAIL
+              valueFrom:
+                secretKeyRef: {name: {{ $secret | quote }}, key: BOOTSTRAP_EMAIL, optional: true}
+            - name: BOOTSTRAP_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ $secret | quote }}, key: BOOTSTRAP_PASSWORD, optional: true}
+            {{- else if or (eq $component "registry") (eq $component "audit") }}
+            {{- $secret := default $.Values.existingSecret (ternary $.Values.registrySecret $.Values.auditSecret (eq $component "registry")) }}
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef: {name: {{ $secret | quote }}, key: MONGO_URI}
+            {{- else if eq $component "notify" }}
+            {{- $secret := default $.Values.existingSecret $.Values.notifySecret }}
+            - {name: SMTP_ADDR, value: {{ default (printf "%s-mailpit:1025" $prefix) $.Values.smtp.address | quote }}}
+            - {name: SMTP_FROM, value: {{ $.Values.smtp.from | quote }}}
+            - {name: SMTP_REQUIRE_TLS, value: {{ and $.Values.smtp.requireTLS (not (and $.Values.demo.enabled (not $.Values.smtp.address))) | quote }}}
+            - name: SMTP_USERNAME
+              valueFrom:
+                secretKeyRef: {name: {{ $secret | quote }}, key: SMTP_USERNAME, optional: true}
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ $secret | quote }}, key: SMTP_PASSWORD, optional: true}
+            {{- else }}
+            - {name: WORKLOAD_NAME, value: {{ trimPrefix "echo-" $component | quote }}}
+            {{- end }}
+          {{- if $.Values.rpcTLS.secretName }}
+          volumeMounts:
+            - {name: rpc-tls, mountPath: /var/run/governance-tls, readOnly: true}
+          {{- end }}
+      {{- if $.Values.rpcTLS.secretName }}
+      volumes:
+        - name: rpc-tls
+          secret:
+            secretName: {{ $.Values.rpcTLS.secretName | quote }}
+            {{- if $broker }}
+            items:
+              - {key: ca.crt, path: ca.crt}
+            {{- else }}
+            items:
+              - {key: tls.crt, path: tls.crt}
+              - {key: tls.key, path: tls.key}
+            {{- end }}
+      {{- end }}
+{{- end }}

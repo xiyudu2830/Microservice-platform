@@ -1,0 +1,31 @@
+image:
+  repository: governance
+  tag: local
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+replicaCount: 2
+existingSecret: governance-secrets
+authSecret: ""
+registrySecret: ""
+auditSecret: ""
+notifySecret: ""
+rpcTLS:
+  secretName: ""
+  serverName: ""
+smtp:
+  address: ""
+  from: governance@example.test
+  requireTLS: true
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+demo:
+  enabled: false
+  postgresImage: postgres:17-alpine
+  mongoImage: mongo:8.0
+  mailpitImage: ghcr.io/axllent/mailpit:v1.33.1
+  storage: 1Gi
