@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package governance.v1;
+option go_package = "github.com/xiyudu2830/Microservice-platform/api/governance/v1;governancev1";
+
+service Auth {
+  rpc Login(LoginRequest) returns (Session);
+  rpc Verify(VerifyRequest) returns (Identity);
+  rpc CreateUser(CreateUserRequest) returns (Identity);
+}
+message LoginRequest { string email = 1; string password = 2; }
+message Session { string token = 1; int64 expires_unix = 2; Identity identity = 3; }
+message VerifyRequest { string token = 1; }
+message Identity { string id = 1; string role = 2; }
+message CreateUserRequest { string email = 1; string password = 2; string role = 3; }
+
+service Registry {
+  rpc Put(Route) returns (Route);
+  rpc Get(RouteKey) returns (Route);
+  rpc List(Empty) returns (Routes);
+}
+message Empty {}
+message RouteKey { string service = 1; }
+message Route {
+  string service = 1;
+  string default_backend = 2;
+  repeated Rule rules = 3;
+}
+message Rule { string role = 1; string region = 2; string backend = 3; }
+message Routes { repeated Route routes = 1; }
+
+service Workload { rpc Invoke(Invocation) returns (InvocationResult); }
+message Invocation { string request_id = 1; string message = 2; }
+message InvocationResult { string request_id = 1; string backend = 2; string message = 3; }
+
+service Audit {
+  rpc Record(AuditEvent) returns (Empty);
+  rpc List(Empty) returns (AuditEvents);
+}
+message AuditEvent {
+  string request_id = 1;
+  string actor_id = 2;
+  string method = 3;
+  string path = 4;
+  int32 status = 5;
+  int64 unix_millis = 6;
+  int64 duration_millis = 7;
+}
+message AuditEvents { repeated AuditEvent events = 1; }
+
+service Notify { rpc Send(Notification) returns (Empty); }
+message Notification { string to = 1; string subject = 2; string body = 3; }
