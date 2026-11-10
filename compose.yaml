@@ -1,0 +1,132 @@
+name: governance
+x-app: &app
+  image: governance:local
+  pull_policy: never
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  healthcheck:
+    test: [CMD, wget, -q, --spider, http://127.0.0.1:8081/readyz]
+    interval: 2s
+    timeout: 2s
+    retries: 15
+
+x-rpc: &rpc
+  INTERNAL_RPC_KEY: ${INTERNAL_RPC_KEY:?Run scripts/init-demo.sh}
+x-workloads: &workloads
+  WORKLOADS: standard=echo-standard:9090,priority=echo-priority:9090
+
+services:
+  broker:
+    <<: *app
+    build: .
+    command: [broker]
+    environment:
+      <<: [*rpc, *workloads]
+      AUTH_ADDR: auth:9090
+      REGISTRY_ADDR: registry:9090
+      AUDIT_ADDR: audit:9090
+      NOTIFY_ADDR: notify:9090
+    ports:
+      - "127.0.0.1:${BROKER_PORT:-8080}:8080"
+    depends_on:
+      auth: {condition: service_healthy}
+      registry: {condition: service_healthy}
+      audit: {condition: service_healthy}
+      notify: {condition: service_healthy}
+      echo-standard: {condition: service_healthy}
+      echo-priority: {condition: service_healthy}
+
+  auth:
+    <<: *app
+    command: [auth]
+    environment:
+      <<: *rpc
+      POSTGRES_DSN: postgres://governance:${POSTGRES_PASSWORD}@postgres:5432/governance?sslmode=disable
+      BOOTSTRAP_EMAIL: ${BOOTSTRAP_EMAIL:?Run scripts/init-demo.sh}
+      BOOTSTRAP_PASSWORD: ${BOOTSTRAP_PASSWORD:?Run scripts/init-demo.sh}
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  registry:
+    <<: *app
+    command: [registry]
+    environment:
+      <<: [*rpc, *workloads]
+      MONGO_URI: mongodb://governance:${MONGO_PASSWORD}@mongo:27017/?authSource=admin
+    depends_on:
+      mongo: {condition: service_healthy}
+
+  audit:
+    <<: *app
+    command: [audit]
+    environment:
+      <<: *rpc
+      MONGO_URI: mongodb://governance:${MONGO_PASSWORD}@mongo:27017/?authSource=admin
+    depends_on:
+      mongo: {condition: service_healthy}
+
+  notify:
+    <<: *app
+    command: [notify]
+    environment:
+      <<: *rpc
+      SMTP_ADDR: mailpit:1025
+      SMTP_FROM: governance@example.test
+      SMTP_REQUIRE_TLS: "false"
+    depends_on:
+      mailpit: {condition: service_started}
+
+  echo-standard:
+    <<: *app
+    command: [echo]
+    environment:
+      <<: *rpc
+      WORKLOAD_NAME: standard
+
+  echo-priority:
+    <<: *app
+    command: [echo]
+    environment:
+      <<: *rpc
+      WORKLOAD_NAME: priority
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: governance
+      POSTGRES_DB: governance
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run scripts/init-demo.sh}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U governance -d governance"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  mongo:
+    image: mongo:8.0
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: governance
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:?Run scripts/init-demo.sh}
+    volumes:
+      - mongo:/data/db
+    healthcheck:
+      test: [CMD-SHELL, 'mongosh --quiet --username "$$MONGO_INITDB_ROOT_USERNAME" --password "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok"']
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  mailpit:
+    image: ghcr.io/axllent/mailpit:v1.33.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MAILPIT_PORT:-8025}:8025"
+
+volumes:
+  postgres:
+  mongo:
